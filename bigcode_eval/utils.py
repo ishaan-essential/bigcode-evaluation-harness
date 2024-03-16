@@ -9,11 +9,18 @@ import torch
 from torch.utils.data import IterableDataset
 from tqdm import tqdm
 
+import sys
+sys.path.append('/home/ishaanshah/essential_maxtext/maxtext/MaxText')
+from init_gemma_2b import init_gemma
+
+
 INFILL_MODE = False
 INSTRUCTION_MODE = False
 
 
-class TokenizedDataset(IterableDataset):
+
+
+class TokenizedDataset:
     """Tokenize and preprocess the dataset
     Multiple copies of the same prompt are sent sequentially. See compute_code for more details.
     The prompt can either be:
@@ -47,7 +54,7 @@ class TokenizedDataset(IterableDataset):
         self.has_encoder = has_encoder
         self.instruction_tokens = instruction_tokens
 
-    def __iter__(self):
+    def get_data(self):
         prompts = []
         prompts_encoder = []
         infill = []
@@ -95,24 +102,8 @@ class TokenizedDataset(IterableDataset):
             return_token_type_ids = False
         else:
             return_token_type_ids = None  # default
-
-        outputs = self.tokenizer(
-            prompts,
-            padding=True,
-            truncation=True,
-            return_tensors="pt",
-            max_length=self.max_length,
-            return_token_type_ids=return_token_type_ids,
-        )
-        if self.has_encoder:
-            outputs_encoder = self.tokenizer(
-                prompts_encoder,
-                padding=True,
-                truncation=True,
-                return_tensors="pt",
-                max_length=self.max_length,
-                return_token_type_ids=return_token_type_ids,
-            )
+        
+        inputs = []
 
         if self.n_copies == 1 and self.n_tasks % self.num_devices != 0:
             self.n_copies = 2
@@ -122,22 +113,11 @@ class TokenizedDataset(IterableDataset):
 
         for sample in range(self.n_tasks):
             for _ in range(self.n_copies):
-                if self.has_encoder:
-                    yield {
-                        "ids": outputs.input_ids[sample],
-                        "ids_encoder": outputs_encoder.input_ids[sample],
-                        "task_id": sample,
-                        "input_len": outputs.attention_mask[sample].sum(),
-                        "input_len_encoder": outputs_encoder.attention_mask[
-                            sample
-                        ].sum(),
-                    }
-                else:
-                    yield {
-                        "ids": outputs.input_ids[sample],
-                        "task_id": sample,
-                        "input_len": outputs.attention_mask[sample].sum(),
-                    }
+                inputs.append({
+                    "ids": prompts[sample],
+                    "task_id": sample
+                })
+        return inputs
 
     def _make_infill_prompt(self, prefix, suffix, preprefix=""):
         """Make a prompt for infilling.
@@ -226,7 +206,7 @@ def complete_code(
     accelerator,
     model,
     tokenizer,
-    dataloader,
+    dataset,
     n_tasks,
     limit_start=0,
     batch_size=20,
@@ -248,74 +228,26 @@ def complete_code(
     # where len(code_gens) = n_tasks and len(code_gens[0]) = number of generated code samples
     code_gens: List[List[Optional[str]]] = [[] for _ in range(n_tasks)]
     generations = [] if not intermediate_generations else intermediate_generations
-    gen_token_dict = defaultdict(list)  # dict of list of generated tokens
-    for step, batch in tqdm(
-        enumerate(dataloader),
-        total=math.ceil(
-            n_tasks * dataloader.dataset.n_copies / accelerator.num_processes
-        ),
-    ):
-        with torch.no_grad():
-            if task.stop_words:
-                # Set the start_length after which to check for stopping to be the longest input ignoring padding
-                max_len = batch["input_len"].max().item()
-                if "ids_encoder" in batch:
-                    max_len += 1  # Add 1 for decoder_start_token_id
-                gen_kwargs["stopping_criteria"][0].start_length = max_len
-            if hasattr(task, "max_length_multiplier") and task.max_length_multiplier:
-                idx = 1 if task.stop_words else 0
-                gen_kwargs["stopping_criteria"][idx].input_length = (
-                    batch["input_len"].max().item()
-                )
+    gen_code_dict = defaultdict(list)  # dict of list of generated tokens
+    for step in range(len(dataset)):
+        print(f'step: {step}, len(dataset): {len(dataset)}')
 
-            inputs = batch["ids"][:, : batch["input_len"]] if tokenizer.padding_side == "right" else batch["ids"]
-            if "ids_encoder" in batch:
-                if is_wrapped:
-                    generated_tokens = accelerator.unwrap_model(model).generate(
-                        decoder_input_ids=inputs,
-                        input_ids=batch["ids_encoder"][:, : batch["input_len_encoder"]],
-                        num_return_sequences=batch_size,
-                        decoder_start_token_id=tokenizer.pad_token_id,
-                        eos_token_id=tokenizer.eos_token_id,
-                        **gen_kwargs,
-                    )
-                else:
-                    generated_tokens = model.generate(
-                        decoder_input_ids=inputs,
-                        input_ids=batch["ids_encoder"][:, : batch["input_len_encoder"]],
-                        num_return_sequences=batch_size,
-                        decoder_start_token_id=tokenizer.pad_token_id,
-                        eos_token_id=tokenizer.eos_token_id,
-                        **gen_kwargs,
-                    )
-            else:
-                if is_wrapped:
-                    # 8bit and 4bit models are wrapped in accelerator
-                    generated_tokens = accelerator.unwrap_model(model).generate(
-                        input_ids=inputs,
-                        num_return_sequences=batch_size,
-                        **gen_kwargs,
-                    )
-                else:
-                    generated_tokens = model.generate(
-                        input_ids=inputs,
-                        num_return_sequences=batch_size,
-                        **gen_kwargs,
-                    )
+        inputs = dataset[step]
+
+        with torch.no_grad():
+            generated_code = model.generate(
+                input_ids=inputs,
+                num_return_sequences=batch_size,
+                **gen_kwargs,
+            )
             # each task is generated batch_size times
             generated_tasks = batch["task_id"].repeat(batch_size)
-            generated_tokens = accelerator.pad_across_processes(
-                generated_tokens, dim=1, pad_index=tokenizer.pad_token_id
-            )
-
-            generated_tokens, generated_tasks = accelerator.gather(
-                (generated_tokens, generated_tasks)
-            )
-            generated_tokens = generated_tokens.cpu().numpy()
+           
+            #generated_tokens = generated_tokens.cpu().numpy()
             generated_tasks = generated_tasks.cpu().numpy()
 
-            for sample, generated_tokens in zip(generated_tasks, generated_tokens):
-                gen_token_dict[sample].append(generated_tokens)
+            for sample, generated_code in zip(generated_tasks, generated_code):
+                gen_code_dict[sample].append(generated_code)
 
             if save_every_k_tasks >= 1 and (step + 1) % save_every_k_tasks == 0:
                 if not intermediate_save_generations_path:
@@ -331,7 +263,7 @@ def complete_code(
                     instruction_tokens,
                     postprocess,
                     code_gens,
-                    gen_token_dict,
+                    gen_code_dict,
                 )
                 with open(intermediate_save_generations_path, "w") as fp:
                     json.dump(generations + code_gens, fp)
@@ -339,7 +271,7 @@ def complete_code(
                         f"intermediate generations were saved at {intermediate_save_generations_path}"
                     )
                 # reset gen_token_dict - prevent redundant decoding
-                gen_token_dict = defaultdict(list)
+                gen_code_dict = defaultdict(list)
 
     code_gens = update_code_gens(
         task,
@@ -349,7 +281,7 @@ def complete_code(
         instruction_tokens,
         postprocess,
         code_gens,
-        gen_token_dict,
+        gen_code_dict,
     )
 
     generations.extend(code_gens)
@@ -364,37 +296,12 @@ def update_code_gens(
     instruction_tokens,
     postprocess,
     code_gens,
-    gen_token_dict,
+    gen_code_dict,
 ):  
-    for sample, generated_tokens in gen_token_dict.items():
-        for s in generated_tokens:
-            if INFILL_MODE or tokenizer.eos_token in task.stop_words:
-                if s[0] == tokenizer.bos_token_id:
-                    s = s[1:]
-                # Treat eos token as a regular stop word not removing it from the output
-                # If it's removed it may have the effect of removing it in the middle of a
-                # longer generation in case a batch size > 1 is used, which will result in
-                # a wrong generation as it won't be used for splitting lateron
-                gen_code = tokenizer.decode(
-                    s, skip_special_tokens=False, clean_up_tokenization_spaces=False
-                )
-                try:
-                    # some tokenizers add a multi-token prefix to the generation (e.g ChatGLM)
-                    tokenizer_prefix = tokenizer.decode(tokenizer.get_prefix_tokens())
-                    if gen_code.startswith(f"{tokenizer_prefix}"):
-                        gen_code = gen_code[len(tokenizer_prefix):].lstrip()
-                except:
-                    pass
-                if INFILL_MODE:
-                    gen_code = _parse_infill(gen_code, tokenizer)
-                if INSTRUCTION_MODE:
-                    gen_code = _parse_instruction(gen_code, instruction_tokens)
-            else:
-                gen_code = tokenizer.decode(
-                    s, skip_special_tokens=True, clean_up_tokenization_spaces=True
-                )
-            if not INFILL_MODE:
-                gen_code = gen_code[len(prefix) :]
+    for sample, generated_code in gen_code_dict.items():
+        for gen_code in generated_code:
+            gen_code = gen_code[len(prefix) :]
+
             if postprocess:
                 code_gens[sample].append(
                     task.postprocess_generation(gen_code, int(sample) + limit_start)
