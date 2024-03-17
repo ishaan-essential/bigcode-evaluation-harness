@@ -8,10 +8,11 @@ from typing import List, Optional
 import torch
 from torch.utils.data import IterableDataset
 from tqdm import tqdm
-
+import numpy as np
 import sys
 sys.path.append('/home/ishaanshah/essential_maxtext/maxtext/MaxText')
-from init_gemma_2b import init_gemma
+from init_gemma_2b import generate_gemma
+
 
 
 INFILL_MODE = False
@@ -235,16 +236,19 @@ def complete_code(
         inputs = dataset[step]
 
         with torch.no_grad():
-            generated_code = model.generate(
-                input_ids=inputs,
+            generated_code = generate_gemma(
+                inputs,
                 num_return_sequences=batch_size,
                 **gen_kwargs,
             )
+
+            
+            
             # each task is generated batch_size times
-            generated_tasks = batch["task_id"].repeat(batch_size)
+            generated_tasks = np.array([inputs["task_id"]]).repeat(batch_size)
            
             #generated_tokens = generated_tokens.cpu().numpy()
-            generated_tasks = generated_tasks.cpu().numpy()
+            
 
             for sample, generated_code in zip(generated_tasks, generated_code):
                 gen_code_dict[sample].append(generated_code)
@@ -283,6 +287,8 @@ def complete_code(
         code_gens,
         gen_code_dict,
     )
+
+    
 
     generations.extend(code_gens)
     return generations

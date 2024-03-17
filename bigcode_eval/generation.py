@@ -49,6 +49,8 @@ def parallel_generations(
     if task.stop_words and tokenizer.eos_token: #TODO: Essential - change to our eos token
         task.stop_words.append(tokenizer.eos_token)    
     
+    
+
 
     if args.instruction_tokens:
         instruction_tokens = args.instruction_tokens.split(",")
@@ -61,6 +63,9 @@ def parallel_generations(
                 task.stop_words.append(token)
     else:
         instruction_tokens = None
+
+    gen_kwargs["stopping_criteria"] = task.stop_words 
+   
     if accelerator.is_main_process:
         print(f"number of problems for this task is {n_tasks}")
     n_copies = ceil(args.n_samples / args.batch_size)
@@ -84,14 +89,14 @@ def parallel_generations(
         accelerator,
         model,
         tokenizer,
-        ds_tokenized,
+        ds_tokenized.get_data(),
         n_tasks=n_tasks,
         limit_start=args.limit_start + curr_sample_idx,
         batch_size=args.batch_size,
         prefix=args.prefix,
         instruction_tokens=instruction_tokens,
         postprocess=args.postprocess,
-        is_wrapped=is_loaded_in_8bit or is_loaded_in_4bit,
+        is_wrapped=False,
         save_every_k_tasks=save_every_k_tasks,
         intermediate_generations=intermediate_generations,
         intermediate_save_generations_path=intermediate_save_generations_path,
