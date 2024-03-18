@@ -11,7 +11,7 @@ from tqdm import tqdm
 import numpy as np
 import sys
 sys.path.append('/home/ishaanshah/essential_maxtext/maxtext/MaxText')
-from init_gemma_2b import generate_gemma
+from init_gemma_2b import generate_gemma,generate_samples
 
 
 
@@ -106,16 +106,21 @@ class TokenizedDataset:
         
         inputs = []
 
+
+        """
         if self.n_copies == 1 and self.n_tasks % self.num_devices != 0:
             self.n_copies = 2
             warnings.warn(
                 "n_copies (n_samples/batch_size) was changed from 1 to 2 because n_tasks isn't proportional to num devices"
             )
+        """
+
+        assert self.n_copies == 1, 'Num copies should be 1 in the Tokenized Dataset'
 
         for sample in range(self.n_tasks):
             for _ in range(self.n_copies):
                 inputs.append({
-                    "ids": prompts[sample],
+                    "prompt": prompts[sample],
                     "task_id": sample
                 })
         return inputs
@@ -210,7 +215,7 @@ def complete_code(
     dataset,
     n_tasks,
     limit_start=0,
-    batch_size=20,
+    num_samples=20,
     prefix="",
     instruction_tokens=None,
     postprocess=True,
@@ -230,52 +235,22 @@ def complete_code(
     code_gens: List[List[Optional[str]]] = [[] for _ in range(n_tasks)]
     generations = [] if not intermediate_generations else intermediate_generations
     gen_code_dict = defaultdict(list)  # dict of list of generated tokens
-    for step in range(len(dataset)):
-        print(f'step: {step}, len(dataset): {len(dataset)}')
 
-        inputs = dataset[step]
+    print(f'len(dataset): {len(dataset)}')
 
-        with torch.no_grad():
-            generated_code = generate_gemma(
-                inputs,
-                num_return_sequences=batch_size,
-                **gen_kwargs,
-            )
+   
+    
+    generated_code = generate_samples(
+        dataset,
+        num_return_sequences=num_samples,
+        **gen_kwargs,
+    )
 
-            
-            
-            # each task is generated batch_size times
-            generated_tasks = np.array([inputs["task_id"]]).repeat(batch_size)
-           
-            #generated_tokens = generated_tokens.cpu().numpy()
-            
+    for task_index in range(len(dataset)):
+        task_id = dataset[task_index]['task_id']
+        gen_code_dict[task_id] = generated_code[task_index]
 
-            for sample, generated_code in zip(generated_tasks, generated_code):
-                gen_code_dict[sample].append(generated_code)
-
-            if save_every_k_tasks >= 1 and (step + 1) % save_every_k_tasks == 0:
-                if not intermediate_save_generations_path:
-                    raise ValueError(
-                        "intermediate_save_generations_path cannot be empty!"
-                    )
-
-                code_gens = update_code_gens(
-                    task,
-                    tokenizer,
-                    limit_start,
-                    prefix,
-                    instruction_tokens,
-                    postprocess,
-                    code_gens,
-                    gen_code_dict,
-                )
-                with open(intermediate_save_generations_path, "w") as fp:
-                    json.dump(generations + code_gens, fp)
-                    print(
-                        f"intermediate generations were saved at {intermediate_save_generations_path}"
-                    )
-                # reset gen_token_dict - prevent redundant decoding
-                gen_code_dict = defaultdict(list)
+    
 
     code_gens = update_code_gens(
         task,
